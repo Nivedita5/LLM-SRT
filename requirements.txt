@@ -22,7 +22,6 @@ datasets
 sacrebleu
 jiwer
 librosa
-unbabel-comet
 nltk
 openpyxl
 torch==2.4.0
