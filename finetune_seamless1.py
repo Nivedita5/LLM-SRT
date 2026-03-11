@@ -83,8 +83,8 @@ class ModelConfig:
 class TrainingConfig:
     output_dir: str                  = "seamless_m4t_finetuned"
     num_train_epochs: int            = 10
-    per_device_train_batch_size: int = 8    # keep at 1 for 40GB GPU with 8-bit + LoRA
-    per_device_eval_batch_size: int  = 8
+    per_device_train_batch_size: int = 1    # keep at 1 for 40GB GPU with 8-bit + LoRA
+    per_device_eval_batch_size: int  = 1
     gradient_accumulation_steps: int = 16   # effective batch = 1×16 = 16
     learning_rate: float             = 1e-4  # higher LR suits LoRA adapters
     warmup_steps: int                = 500
@@ -195,7 +195,7 @@ def apply_lora(model, load_in_8bit: bool = False):
 # 3. Dataset loading
 # ---------------------------------------------------------------------------
 
-def load_json_manifest(manifest_path: str, audio_dir: str = "", max_duration_secs: float = 30.0) -> List[Dict]:
+def load_json_manifest(manifest_path: str, audio_dir: str = "", max_duration_secs: float = 30.0, min_duration_secs: float = 0.1) -> List[Dict]:
     """
     Load a nested source/target JSON array manifest.
 
@@ -244,10 +244,16 @@ def load_json_manifest(manifest_path: str, audio_dir: str = "", max_duration_sec
             skipped += 1
             continue
 
-        # Check duration — long clips cause OOM even at batch_size=1
+        # Check duration — too short causes negative spectrogram dims, too long causes OOM
         try:
             info = sf.info(audio_path)
             duration = info.frames / info.samplerate
+            if duration < min_duration_secs:  # less than min → too short for feature extraction
+                logger.warning(
+                    f"Entry {i}: audio too short ({duration:.3f}s < {min_duration_secs}s) — skipping."
+                )
+                skipped += 1
+                continue
             if duration > max_duration_secs:
                 logger.warning(
                     f"Entry {i}: audio too long ({duration:.1f}s > {max_duration_secs}s) — skipping."
@@ -296,6 +302,23 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         # --- audio → input_features ---
+        # Filter out any samples whose audio array is too short to featurize
+        valid_features = []
+        for f in features:
+            arr = f["audio"]["array"]
+            # SeamlessM4T uses a 400-sample FFT window at 16kHz → need at least 400 samples
+            if len(arr) >= 400:
+                valid_features.append(f)
+            else:
+                logger.warning(
+                    f"Collator: skipping sample with only {len(arr)} audio samples "
+                    f"(too short for feature extraction)."
+                )
+        if not valid_features:
+            # Return empty batch — Trainer will skip it
+            return {}
+        features = valid_features
+
         audio_arrays  = [f["audio"]["array"] for f in features]
         sampling_rate = features[0]["audio"]["sampling_rate"]
 
@@ -469,37 +492,60 @@ class OOMSkippingSeq2SeqTrainer(Seq2SeqTrainer):
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune SeamlessM4T for S2TT")
 
-    # Data
-    parser.add_argument("--train_manifest", default=DataConfig.train_manifest)
-    parser.add_argument("--dev_manifest",   default=DataConfig.dev_manifest)
-    parser.add_argument("--test_manifest",  default=DataConfig.test_manifest)
-    parser.add_argument("--audio_dir",      default=DataConfig.audio_dir)
-    parser.add_argument("--source_lang",    default=DataConfig.source_lang)
-    parser.add_argument("--target_lang",    default=DataConfig.target_lang)
+    # ---- Data ----
+    parser.add_argument("--train_manifest", default=DataConfig.train_manifest,
+                        help="Path to training manifest JSON.")
+    parser.add_argument("--dev_manifest",   default=DataConfig.dev_manifest,
+                        help="Path to validation manifest JSON.")
+    parser.add_argument("--test_manifest",  default=DataConfig.test_manifest,
+                        help="Path to test manifest JSON.")
+    parser.add_argument("--audio_dir",      default=DataConfig.audio_dir,
+                        help="Optional base directory prepended to relative audio paths.")
+    parser.add_argument("--source_lang",    default=DataConfig.source_lang,
+                        help="Source language code, e.g. 'eng'.")
+    parser.add_argument("--target_lang",    default=DataConfig.target_lang,
+                        help="Target language code, e.g. 'hin'.")
+    parser.add_argument("--train_fraction", type=float, default=1.0,
+                        help="Fraction of training set to use, e.g. 0.01 for 1%%.")
+    parser.add_argument("--val_fraction",   type=float, default=1.0,
+                        help="Fraction of validation set to use, e.g. 0.01 for 1%%.")
+    parser.add_argument("--test_fraction",  type=float, default=1.0,
+                        help="Fraction of test set to use, e.g. 0.01 for 1%%.")
+    parser.add_argument("--max_duration",   type=float, default=30.0,
+                        help="Skip audio clips longer than this many seconds (default: 30).")
+    parser.add_argument("--min_duration",   type=float, default=0.1,
+                        help="Skip audio clips shorter than this many seconds (default: 0.1).")
 
-    # Model
-    parser.add_argument("--model_name_or_path", default=ModelConfig.model_name_or_path)
+    # ---- Model ----
+    parser.add_argument("--model_name_or_path", default=ModelConfig.model_name_or_path,
+                        help="HuggingFace model name or local path.")
     parser.add_argument("--load_in_8bit", action="store_true", default=False,
                         help="Load in 8-bit quantization (requires bitsandbytes). "
                              "LoRA adapters are added automatically.")
 
-    # Training
-    parser.add_argument("--output_dir",                  default=TrainingConfig.output_dir)
-    parser.add_argument("--num_train_epochs",    type=int,   default=TrainingConfig.num_train_epochs)
+    # ---- Training ----
+    parser.add_argument("--output_dir",     default=TrainingConfig.output_dir,
+                        help="Directory to save checkpoints and final model.")
+    parser.add_argument("--num_train_epochs", type=int, default=TrainingConfig.num_train_epochs,
+                        help="Total number of training epochs.")
     parser.add_argument("--per_device_train_batch_size", type=int,
-                        default=TrainingConfig.per_device_train_batch_size)
-    parser.add_argument("--learning_rate",       type=float, default=TrainingConfig.learning_rate)
-    parser.add_argument("--fp16",                action="store_true", default=TrainingConfig.fp16)
-    parser.add_argument("--resume_from_checkpoint", default=None)
-    parser.add_argument("--train_fraction", type=float, default=1.0,
-                        help="Fraction of training set to use, e.g. 0.01 for 1%%.")
-    parser.add_argument("--val_fraction", type=float, default=1.0,
-                        help="Fraction of validation set to use, e.g. 0.01 for 1%%.")
-    parser.add_argument("--test_fraction", type=float, default=1.0,
-                        help="Fraction of test set to use, e.g. 0.01 for 1%%.")
-    parser.add_argument("--max_duration", type=float, default=30.0,
-                        help="Skip audio clips longer than this many seconds (default: 30). "
-                             "Longer clips cause OOM even at batch_size=1.")
+                        default=TrainingConfig.per_device_train_batch_size,
+                        help="Batch size per GPU for training.")
+    parser.add_argument("--per_device_eval_batch_size", type=int,
+                        default=TrainingConfig.per_device_eval_batch_size,
+                        help="Batch size per GPU for evaluation.")
+    parser.add_argument("--gradient_accumulation_steps", type=int,
+                        default=TrainingConfig.gradient_accumulation_steps,
+                        help="Number of gradient accumulation steps. "
+                             "Effective batch = train_bs × accum × num_gpus.")
+    parser.add_argument("--learning_rate",  type=float, default=TrainingConfig.learning_rate,
+                        help="Peak learning rate.")
+    parser.add_argument("--warmup_steps",   type=int,   default=TrainingConfig.warmup_steps,
+                        help="Number of warmup steps for LR scheduler.")
+    parser.add_argument("--fp16",           action="store_true", default=TrainingConfig.fp16,
+                        help="Enable mixed precision (fp16) training.")
+    parser.add_argument("--resume_from_checkpoint", default=None,
+                        help="Path to a checkpoint directory to resume training from.")
 
     return parser.parse_args()
 
@@ -558,7 +604,7 @@ def main():
     sr = DataConfig.sampling_rate
 
     def make_split(manifest, fraction: float = 1.0):
-        samples = load_json_manifest(manifest, args.audio_dir, max_duration_secs=args.max_duration)
+        samples = load_json_manifest(manifest, args.audio_dir, max_duration_secs=args.max_duration, min_duration_secs=args.min_duration)
         if fraction < 1.0:
             n = max(1, int(len(samples) * fraction))
             samples = samples[:n]
@@ -594,10 +640,10 @@ def main():
         output_dir=args.output_dir,
         num_train_epochs=args.num_train_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=TrainingConfig.per_device_eval_batch_size,
-        gradient_accumulation_steps=TrainingConfig.gradient_accumulation_steps,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
-        warmup_steps=TrainingConfig.warmup_steps,
+        warmup_steps=args.warmup_steps,
         weight_decay=TrainingConfig.weight_decay,
         fp16=args.fp16,
         gradient_checkpointing=TrainingConfig.gradient_checkpointing,

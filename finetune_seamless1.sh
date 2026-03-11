@@ -1,0 +1,22 @@
+CUDA_VISIBLE_DEVICES=1,3,5 torchrun  --master_port=29501 --nproc_per_node=3 finetune_seamless1.py \
+  --train_manifest  /raid/chandresh/Nivedita/STDATA/Data/Hindi/en-hi/seg_data/train/txt/manifest.json \
+  --dev_manifest    /raid/chandresh/Nivedita/STDATA/Data/Hindi/en-hi/seg_data/dev/txt/manifest.json \
+  --test_manifest   /raid/chandresh/Nivedita/STDATA/Data/Hindi/en-hi/seg_data/test/txt/manifest.json \
+  --source_lang     eng \
+  --target_lang     hin \
+  --train_fraction  1.0 \
+  --val_fraction    1.0 \
+  --test_fraction   1.0 \
+  --min_duration    0.5 \
+  --max_duration    40.0 \
+  --model_name_or_path facebook/seamless-m4t-v2-large \
+  --load_in_8bit \
+  --output_dir                    seamless_finetuned \
+  --num_train_epochs              5 \
+  --per_device_train_batch_size   8 \
+  --per_device_eval_batch_size    8 \
+  --gradient_accumulation_steps   8 \
+  --learning_rate                 1e-4 \
+  --warmup_steps                  500 \
+  --fp16 \
+  --resume_from_checkpoint        seamless_finetuned/checkpoint-1
