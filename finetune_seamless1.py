@@ -546,6 +546,10 @@ def parse_args():
                         help="Enable mixed precision (fp16) training.")
     parser.add_argument("--resume_from_checkpoint", default=None,
                         help="Path to a checkpoint directory to resume training from.")
+    parser.add_argument("--test_predictions_file", default="test_predictions.tsv",
+                        help="TSV file to save test set predictions after training. "
+                             "Columns: audio_path, reference, prediction. "
+                             "Set to empty string to disable.")
 
     return parser.parse_args()
 
@@ -553,6 +557,13 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # 7. Main
 # ---------------------------------------------------------------------------
+
+def is_main_process() -> bool:
+    """True if running single-GPU or if this is rank 0 in a distributed run."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank() == 0
+    return True
+
 
 def main():
     args = parse_args()
@@ -699,10 +710,63 @@ def main():
     trainer.log_metrics("test", metrics)
     trainer.save_metrics("test", metrics)
 
+    # ---- Save test predictions ----
+    if is_main_process() and args.test_predictions_file:
+        save_test_predictions(
+            test_output=test_output,
+            dataset=dataset["test"],
+            processor=processor,
+            output_path=os.path.join(args.output_dir, args.test_predictions_file),
+        )
 
-# ---------------------------------------------------------------------------
-# 8. Inference helper
-# ---------------------------------------------------------------------------
+
+def save_test_predictions(
+    test_output,
+    dataset,
+    processor,
+    output_path: str,
+):
+    """
+    Decode test predictions and save to a TSV file.
+
+    Columns: audio_path | reference | prediction
+
+    Args:
+        test_output : PredictionOutput from trainer.predict()
+        dataset     : the test HuggingFace Dataset (has 'audio' and 'transcription' columns)
+        processor   : SeamlessM4T processor for decoding token IDs
+        output_path : path to write the TSV file
+    """
+    vocab_size = processor.tokenizer.vocab_size
+
+    pred_ids  = test_output.predictions
+    label_ids = test_output.label_ids
+
+    # Clip token IDs to valid range (guards against OOM-skipped batch artifacts)
+    if isinstance(pred_ids, np.ndarray):
+        pred_ids = np.clip(pred_ids, 0, vocab_size - 1)
+    else:
+        pred_ids = [[max(0, min(t, vocab_size - 1)) for t in seq] for seq in pred_ids]
+
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+    label_ids = np.clip(label_ids, 0, vocab_size - 1)
+
+    pred_strs  = processor.batch_decode(pred_ids,  skip_special_tokens=True)
+    label_strs = processor.batch_decode(label_ids, skip_special_tokens=True)
+
+    # Retrieve audio paths from dataset (may be shorter than dataset if batches were skipped)
+    audio_paths = [dataset[i]["audio"]["path"] for i in range(len(pred_strs))]
+
+    logger.info(f"Saving {len(pred_strs)} test predictions to: {output_path}")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("audio_path\treference\tprediction\n")
+        for audio_path, ref, pred in zip(audio_paths, label_strs, pred_strs):
+            audio_path = str(audio_path).replace("\t", " ")
+            ref        = ref.replace("\t", " ")
+            pred       = pred.replace("\t", " ")
+            f.write(f"{audio_path}\t{ref}\t{pred}\n")
+
+    logger.info(f"Test predictions saved to: {output_path}")
 
 def translate_audio_file(
     audio_path: str,
