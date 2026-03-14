@@ -154,6 +154,28 @@ def _disable_flash_attn() -> None:
 _disable_flash_attn()
 # ──────────────────────────────────────────────────────────────────────────
 
+# ── Redirect PyTorch / HuggingFace caches away from home (quota issues) ──
+# Torch JIT writes generated code to ~/.cache/torch by default.
+# If home is over quota this crashes with OSError 122.
+# Point all caches at /raid which has plenty of space.
+def _redirect_caches() -> None:
+    _raid_base = os.environ.get("RAID_CACHE_DIR", "/raid/chandresh/cache")
+    _torch_dir = os.path.join(_raid_base, "torch")
+    _hf_dir    = os.path.join(_raid_base, "huggingface")
+    os.makedirs(_torch_dir, exist_ok=True)
+    os.makedirs(_hf_dir,    exist_ok=True)
+    os.environ.setdefault("TORCH_HOME",          _torch_dir)
+    os.environ.setdefault("TORCH_HUB",           _torch_dir)
+    os.environ.setdefault("XDG_CACHE_HOME",      _raid_base)
+    os.environ.setdefault("HF_HOME",             _hf_dir)
+    os.environ.setdefault("TRANSFORMERS_CACHE",  _hf_dir)
+    os.environ.setdefault("HF_DATASETS_CACHE",   os.path.join(_hf_dir, "datasets"))
+    # PyTorch JIT specifically uses this env var
+    os.environ.setdefault("PYTORCH_KERNEL_CACHE_PATH", os.path.join(_torch_dir, "kernels"))
+
+_redirect_caches()
+# ──────────────────────────────────────────────────────────────────────────
+
 import json
 import math
 import argparse
@@ -171,7 +193,9 @@ from transformers import (
     Qwen2AudioForConditionalGeneration,
     AutoProcessor,
     TrainingArguments,
+    Seq2SeqTrainingArguments,
     Trainer,
+    Seq2SeqTrainer,
     EarlyStoppingCallback,
     set_seed,
 )
@@ -207,9 +231,9 @@ class ScriptConfig:
     output_dir: str = "./qwen2-audio-translation-finetuned"
 
     # ── Dataset paths ──────────────────────────
-    train_json: str = "/raid/chandresh/Nivedita/STDATA/Data/Hindi/en-hi/seg_data/train/txt/manifest.json"
-    eval_json:  str = "/raid/chandresh/Nivedita/STDATA/Data/Hindi/en-hi/seg_data/dev/txt/manifest.json"
-    test_json:  str = "/raid/chandresh/Nivedita/STDATA/Data/Hindi/en-hi/seg_data/test/txt/manifest.json"
+    train_json: str = "data/train.json"
+    eval_json:  str = "data/dev.json"
+    test_json:  str = "data/test.json"
     # Optional base directory to rebase audio_local_path values.
     # Leave "" to use paths exactly as written in the JSON.
     audio_root: str = ""
@@ -405,26 +429,45 @@ class SpeechTranslationCollator:
     processor: AutoProcessor
     label_pad_token_id: int = -100
 
+    @staticmethod
+    def _t(x) -> torch.Tensor:
+        """HuggingFace Dataset.map() returns tensors as nested Python lists.
+        Convert back to a proper 1-D / N-D tensor before collating."""
+        if isinstance(x, torch.Tensor):
+            return x
+        import numpy as np
+        if isinstance(x, np.ndarray):
+            return torch.from_numpy(x)
+        return torch.tensor(x)
+
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # Re-tensorise every field (Dataset.map serialises tensors to lists)
+        input_ids       = [self._t(f["input_ids"])       for f in features]
+        attention_masks = [self._t(f["attention_mask"])  for f in features]
+        labels          = [self._t(f["labels"])          for f in features]
+        inp_feat        = [self._t(f["input_features"])          for f in features]
+        feat_attn_mask  = [self._t(f["feature_attention_mask"])  for f in features]
+
         input_ids_padded = torch.nn.utils.rnn.pad_sequence(
-            [f["input_ids"]      for f in features], batch_first=True,
+            input_ids, batch_first=True,
             padding_value=self.processor.tokenizer.pad_token_id,
         )
         attn_mask_padded = torch.nn.utils.rnn.pad_sequence(
-            [f["attention_mask"] for f in features], batch_first=True, padding_value=0,
+            attention_masks, batch_first=True, padding_value=0,
         )
         labels_padded = torch.nn.utils.rnn.pad_sequence(
-            [f["labels"]         for f in features], batch_first=True,
+            labels, batch_first=True,
             padding_value=self.label_pad_token_id,
         )
-        input_features         = torch.stack([f["input_features"]          for f in features])
-        feature_attention_mask = torch.stack([f["feature_attention_mask"]  for f in features])
+        # Audio features from the Whisper encoder are fixed-size — just stack
+        input_features_stacked         = torch.stack(inp_feat)
+        feature_attention_mask_stacked = torch.stack(feat_attn_mask)
 
         return {
             "input_ids":               input_ids_padded,
             "attention_mask":          attn_mask_padded,
-            "input_features":          input_features,
-            "feature_attention_mask":  feature_attention_mask,
+            "input_features":          input_features_stacked,
+            "feature_attention_mask":  feature_attention_mask_stacked,
             "labels":                  labels_padded,
         }
 
@@ -436,6 +479,17 @@ def load_model_and_processor(cfg: ScriptConfig):
     if is_main_process():
         logger.info(f"Loading processor : {cfg.model_id}")
     processor = AutoProcessor.from_pretrained(cfg.model_id)
+
+    # ── Determine device for this rank ────────────────────────────────────
+    # device_map="auto" lets accelerate shard a model across ALL GPUs on the
+    # node — this is INCOMPATIBLE with DDP where each rank owns one full copy.
+    # In distributed mode (world_size > 1) we pin each rank to its local GPU.
+    # In single-GPU mode we still use "auto" for convenience.
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_distributed = get_world_size() > 1
+    device_map = None if is_distributed else "auto"
+    if is_distributed:
+        torch.cuda.set_device(local_rank)
 
     quant_kwargs: Dict[str, Any] = {}
     if cfg.use_qlora:
@@ -453,14 +507,22 @@ def load_model_and_processor(cfg: ScriptConfig):
     model = Qwen2AudioForConditionalGeneration.from_pretrained(
         cfg.model_id,
         torch_dtype=torch.float16,
-        device_map="auto",
+        device_map=device_map,
         attn_implementation="eager",   # avoids flash_attn / libcudart.so.12 issues
         **quant_kwargs,
     )
 
+    # Move to the correct GPU when not using device_map
+    if is_distributed:
+        model = model.to(f"cuda:{local_rank}")
+
     if cfg.use_qlora:
         from peft import prepare_model_for_kbit_training
-        model = prepare_model_for_kbit_training(model)
+        model = prepare_model_for_kbit_training(
+        model,
+        use_gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},   # add this
+        )
 
     lora_config = LoraConfig(
         r=cfg.lora_r,
@@ -482,13 +544,36 @@ def load_model_and_processor(cfg: ScriptConfig):
 # ─────────────────────────────────────────────
 def build_compute_metrics(processor: AutoProcessor):
     bleu_metric = evaluate.load("sacrebleu")
+    pad_id = processor.tokenizer.pad_token_id
+
+    def _sanitise(ids: np.ndarray) -> np.ndarray:
+        """
+        Prepare a token-ID array for batch_decode:
+          1. Replace padding sentinels (-100 or any value < 0) with pad_token_id
+          2. Clip to [0, vocab_size-1] so no value overflows tokenizer's int32
+          3. Cast to int32  (tokenizers_rust expects i32, not i64)
+        """
+        vocab_size = processor.tokenizer.vocab_size or 152064  # Qwen2-Audio vocab
+        ids = np.where(ids < 0, pad_id, ids)           # replace -100 / negatives
+        ids = np.clip(ids, 0, vocab_size - 1)           # clip out-of-range values
+        return ids.astype(np.int32)
 
     def compute_metrics(eval_pred):
         predictions, label_ids = eval_pred
-        label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+
+        # predictions may be float logits if generate wasn't triggered — take argmax
+        if predictions.dtype.kind == "f":
+            predictions = predictions.argmax(axis=-1)
+
+        predictions = _sanitise(np.array(predictions))
+        label_ids   = _sanitise(np.array(label_ids))
 
         decoded_preds  = processor.tokenizer.batch_decode(predictions, skip_special_tokens=True)
         decoded_labels = processor.tokenizer.batch_decode(label_ids,   skip_special_tokens=True)
+
+        # Strip leading/trailing whitespace
+        decoded_preds  = [p.strip() for p in decoded_preds]
+        decoded_labels = [l.strip() for l in decoded_labels]
 
         result = bleu_metric.compute(
             predictions=decoded_preds,
@@ -502,7 +587,7 @@ def build_compute_metrics(processor: AutoProcessor):
 # ─────────────────────────────────────────────
 # 8.  Build TrainingArguments (distributed-aware)
 # ─────────────────────────────────────────────
-def build_training_args(cfg: ScriptConfig) -> TrainingArguments:
+def build_training_args(cfg: ScriptConfig) -> Seq2SeqTrainingArguments:
     world_size = get_world_size()
     effective_batch = (
         cfg.per_device_train_batch_size
@@ -515,12 +600,13 @@ def build_training_args(cfg: ScriptConfig) -> TrainingArguments:
             f"effective_batch_size={effective_batch}"
         )
 
-    return TrainingArguments(
+    return Seq2SeqTrainingArguments(
         output_dir=cfg.output_dir,
         num_train_epochs=cfg.num_train_epochs,
         per_device_train_batch_size=cfg.per_device_train_batch_size,
         per_device_eval_batch_size=cfg.per_device_eval_batch_size,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
+        gradient_checkpointing_kwargs={"use_reentrant": False}, 
         learning_rate=cfg.learning_rate,
         warmup_ratio=cfg.warmup_ratio,
         lr_scheduler_type=cfg.lr_scheduler_type,
@@ -529,16 +615,16 @@ def build_training_args(cfg: ScriptConfig) -> TrainingArguments:
         bf16=cfg.bf16,
         # ── Distributed ──────────────────────────
         local_rank=cfg.local_rank,           # honours torchrun env var
-        ddp_find_unused_parameters=False,    # LoRA sets unused params; False = faster
+        ddp_find_unused_parameters=True,     # QLoRA: frozen base params get no grad → must be True
         # ── Logging / saving ─────────────────────
         logging_steps=10,
         save_strategy="epoch",
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",         # replaces deprecated evaluation_strategy
         load_best_model_at_end=True,
         metric_for_best_model="bleu",
         greater_is_better=True,
-        predict_with_generate=True,
-        generation_max_length=256,
+        predict_with_generate=True,          # Seq2SeqTrainingArguments only
+        generation_max_length=256,           # Seq2SeqTrainingArguments only
         report_to="tensorboard",
         seed=cfg.seed,
         dataloader_num_workers=0,    # safest for custom audio I/O
@@ -570,7 +656,7 @@ def train(cfg: ScriptConfig):
     collator      = SpeechTranslationCollator(processor=processor)
     training_args = build_training_args(cfg)
 
-    trainer = Trainer(
+    trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
@@ -619,7 +705,7 @@ def test(cfg: ScriptConfig):
     test_ds = test_raw.map(preprocess_fn, remove_columns=raw_cols, num_proc=1)
 
     collator = SpeechTranslationCollator(processor=processor)
-    test_args = TrainingArguments(
+    test_args = Seq2SeqTrainingArguments(
         output_dir=cfg.output_dir,
         per_device_eval_batch_size=cfg.per_device_eval_batch_size,
         predict_with_generate=True,
@@ -631,7 +717,7 @@ def test(cfg: ScriptConfig):
         local_rank=cfg.local_rank,
     )
 
-    trainer = Trainer(
+    trainer = Seq2SeqTrainer(
         model=model,
         args=test_args,
         data_collator=collator,
