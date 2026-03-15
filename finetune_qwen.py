@@ -189,6 +189,8 @@ import numpy as np
 import torch
 import soundfile as sf
 from datasets import Dataset, DatasetDict
+from datasets import load_from_disk
+
 from transformers import (
     Qwen2AudioForConditionalGeneration,
     AutoProcessor,
@@ -228,7 +230,7 @@ def get_world_size() -> int:
 class ScriptConfig:
     # ── Model ──────────────────────────────────
     model_id: str = "Qwen/Qwen2-Audio-7B-Instruct"
-    output_dir: str = "./qwen2-audio-translation-finetuned"
+    output_dir: str = "/Long-ST/Data/en-ar/qwen2-audio-translation-finetuned"
 
     # ── Dataset paths ──────────────────────────
     train_json: str = "data/train.json"
@@ -647,11 +649,19 @@ def train(cfg: ScriptConfig):
 
     if is_main_process():
         logger.info("Preprocessing train split …")
-    train_ds = raw_ds["train"].map(preprocess_fn, remove_columns=raw_cols, num_proc=1)
+    train_ds = raw_ds["train"].map(preprocess_fn, remove_columns=raw_cols, num_proc=1, batched=False,
+    batch_size=4, load_from_cache_file=True,
+    keep_in_memory=False)
 
     if is_main_process():
         logger.info("Preprocessing validation split …")
-    eval_ds = raw_ds["validation"].map(preprocess_fn, remove_columns=raw_cols, num_proc=1)
+    eval_ds = raw_ds["validation"].map(preprocess_fn, remove_columns=raw_cols, num_proc=1, batched=False,
+    batch_size=4, load_from_cache_file=True,
+    keep_in_memory=False)
+
+    train_ds.save_to_disk("/Long-ST/Data/en-ar/seg_data/cache/train_processed")
+    eval_ds.save_to_disk("/Long-ST/Data/en-ar/seg_data/cache/eval_processed")
+
 
     collator      = SpeechTranslationCollator(processor=processor)
     training_args = build_training_args(cfg)
@@ -799,7 +809,7 @@ def parse_args():
     parser.add_argument("--test_json",  default="/raid/chandresh/Nivedita/STDATA/Data/Hindi/en-hi/seg_data/test/txt/manifest.json")
     parser.add_argument("--audio_root", default="",
                         help="Rebase audio_local_path onto this directory")
-    parser.add_argument("--target_language_name", default="Hindi")
+    parser.add_argument("--target_language_name", default="Arabic")
 
     # ── Fraction sampling ──────────────────────
     parser.add_argument("--train_frac", type=float, default=1.0,
@@ -815,8 +825,8 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int,   default=32)
 
     # ── Training ───────────────────────────────
-    parser.add_argument("--epochs",     type=int,   default=3)
-    parser.add_argument("--batch_size", type=int,   default=2)
+    parser.add_argument("--epochs",     type=int,   default=5)
+    parser.add_argument("--batch_size", type=int,   default=4)
     parser.add_argument("--grad_accum", type=int,   default=8)
     parser.add_argument("--lr",         type=float, default=2e-4)
     parser.add_argument("--fp16",       action="store_true", default=True)
